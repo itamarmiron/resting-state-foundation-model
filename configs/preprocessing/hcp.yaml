@@ -1,0 +1,33 @@
+# HCP-1200 resting state: fMRIPrep derivatives -> denoised voxel data.
+# See docs/PREPROCESSING_PLAN.md.
+
+name: hcp
+fmriprep_dir: /net/mraid16/mnt/pool-16/iranig_workspace/HCP_1200/derivatives/fmriprep_rest
+output_dir: /net/mraid16/mnt/pool-16/iranig_workspace/HCP_1200/derivatives/rsfm_voxel
+
+# Relative to fmriprep_dir.
+bold_glob: "sub-*/ses-*/func/*_space-MNI152NLin2009cAsym_res-2_desc-preproc_bold.nii.gz"
+
+# Template brain mask on the same grid as the BOLD data (97x115x97, 2 mm).
+template_mask: ~/.cache/templateflow/tpl-MNI152NLin2009cAsym/tpl-MNI152NLin2009cAsym_res-02_desc-brain_mask.nii.gz
+
+confounds:
+  motion: [trans_x, trans_y, trans_z, rot_x, rot_y, rot_z]
+  n_acompcor: 5          # first N aCompCor components with Mask == "combined" (WM+CSF)
+  cosine: true           # fMRIPrep cosine regressors = high-pass at ~0.008 Hz (128 s)
+  global_signal: false   # GSR
+
+denoise:
+  low_pass: 0.1          # Hz; null disables the low-pass
+  detrend: true
+  standardize: zscore_sample
+
+qc:
+  fd_threshold: 0.5      # mm; a volume above this counts as high-motion
+  max_mean_fd: 0.5       # mm; runs above this are flagged exclude=True (not deleted)
+
+group_mask:
+  min_run_fraction: 0.5  # keep voxels in-brain in at least this fraction of runs (and in template mask)
+
+io:
+  chunk_trs: 100         # TRs read per chunk when streaming the BOLD file
