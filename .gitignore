@@ -4,4 +4,5 @@ __pycache__/
 logs/*
 !logs/.gitkeep
 cache/
-gradients/
+gradients/*/group_*.npy
+gradients/*/runs/

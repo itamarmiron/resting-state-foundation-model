@@ -41,10 +41,10 @@ def main():
 
     atlas = cg.load_atlas()
     grad_dir = cg.GRADIENT_DIR / cg.ATLAS_NAME
-    if not (grad_dir / "group_placeholder.npy").exists():
+    if not (grad_dir / "runs" / f"{REFERENCE_RUN}.npy").exists():
         cg.main(["--placeholder"])
-    group = load_gradients(grad_dir / "group_placeholder.npy")          # (N, G) placeholder!
-    subject = load_gradients(grad_dir / "runs" / f"{REFERENCE_RUN}.npy")
+    group = load_gradients(cg.group_gradient_path())                    # (N, G) Brain-JEPA UKB
+    subject = load_gradients(grad_dir / "runs" / f"{REFERENCE_RUN}.npy")  # HCP, single-subject placeholder
 
     cfg = TemporalBITConfig()
     T = cfg.n_timepoints
@@ -92,7 +92,7 @@ def main():
     else:
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
         print(f"  {time.time() - t0:.2f} s on CPU, peak process RSS {rss:.2f} GiB")
-    print("\nOK (gradients are a single-subject placeholder; see compute_gradients.py)")
+    print("\nOK (group gradients: Brain-JEPA UKB; subject gradients: single-subject placeholder)")
 
 
 if __name__ == "__main__":

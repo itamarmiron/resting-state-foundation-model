@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import compute_gradients as cg
+from positional_embedding import load_gradients
 from temporal_bit import TemporalBIT, TemporalBITConfig, build_v2roi
 
 N_ROIS, N_VOX, G = 5, 80, 6
@@ -150,3 +151,30 @@ def test_subject_gradients_fill_missing_roi():
     out = cg.subject_gradients(fc, reference)
     assert out.shape == (30, 5) and np.isfinite(out).all()
     assert np.array_equal(out[4], reference[4])
+
+
+def test_matches_brainspace():
+    """The numpy ports agree with BrainSpace (exact for affinity and Procrustes; BrainSpace's
+    diffusion map is slightly approximate, see compute_gradients.diffusion_mapping)."""
+    bs_kernels = pytest.importorskip("brainspace.gradient.kernels")
+    from brainspace.gradient.alignment import procrustes as bs_procrustes
+    from brainspace.gradient.embedding import diffusion_mapping as bs_diffusion_mapping
+    rng = np.random.default_rng(2)
+    ts = rng.standard_normal((400, 4)) @ rng.standard_normal((4, 60)) + rng.standard_normal((400, 60))
+    fc = np.corrcoef(ts.T)
+    affinity = cg.compute_affinity(fc)
+    assert np.allclose(affinity, bs_kernels.compute_affinity(fc, kernel="normalized_angle", sparsity=0.9))
+    ours = cg.diffusion_mapping(affinity, 5)
+    theirs, _ = bs_diffusion_mapping(affinity, n_components=5, alpha=0.5, diffusion_time=0, random_state=0)
+    assert all(abs(np.corrcoef(ours[:, c], theirs[:, c])[0, 1]) > 0.99 for c in range(5))
+    src, tgt = rng.standard_normal((60, 5)), rng.standard_normal((60, 5))
+    assert np.allclose(cg.procrustes(src, tgt), bs_procrustes(src, tgt))
+
+
+def test_brainjepa_ukb_gradients_are_default():
+    """The default group gradients are Brain-JEPA's UKB file, (450, 30), loadable for the model."""
+    path = cg.group_gradient_path()
+    assert path.name == "brainjepa_ukb.csv" and path.exists()
+    grad = load_gradients(path)
+    assert grad.shape == (450, 30) and grad.dtype == torch.float32
+    assert cg.group_gradient_path("train").name == "group_train.npy"

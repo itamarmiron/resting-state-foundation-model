@@ -72,7 +72,8 @@ class GradientPositionalEmbedding(nn.Module):
 
 
 def load_gradients(path: str) -> torch.Tensor:
-    """Load an (N, G) gradient matrix saved by ``compute_gradients.py`` (.npy) as float32."""
-    grad = np.load(path)
+    """Load an (N, G) gradient matrix as float32: a .npy from ``compute_gradients.py`` or a
+    headerless .csv like Brain-JEPA's ``gradient_mapping_450.csv``."""
+    grad = np.loadtxt(path, delimiter=",") if str(path).endswith(".csv") else np.load(path)
     assert grad.ndim == 2 and np.isfinite(grad).all(), f"{path}: expected a finite (N, G) matrix"
     return torch.from_numpy(grad.astype(np.float32))

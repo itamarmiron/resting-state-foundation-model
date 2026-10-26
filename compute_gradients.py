@@ -1,6 +1,13 @@
 """Brain gradients for Temporal BIT's Brain Gradient Positioning, computed from HCP.
 
-Two versions (see the model plan):
+The default for now is none of these: it is Brain-JEPA's precomputed UKB group gradients,
+``gradients/<atlas>/brainjepa_ukb.csv``, an unchanged copy of
+https://github.com/Eric-LRL/Brain-JEPA ``data/gradient_mapping_450.csv`` (450 x 30, same
+Tian S3 + Schaefer-400 17N layout as our atlas; the 17N order was checked against our HCP
+gradients). ``group_gradient_path`` picks between it and the HCP versions below, which stay
+available for later comparison.
+
+Two HCP versions (see the model plan):
     group    one fixed (N, G) matrix: diffusion-map embedding of the Fisher-z average FC over
              training runs. Every subject and window gets the same gradients.
     subject  one (N, G) matrix per run, from that run's whole-scan FC (all TRs), Procrustes-aligned
@@ -18,6 +25,7 @@ automatic diffusion time, 30 components. (BrainSpace's ``GradientMaps`` default 
 i.e. the thresholded FC itself; normalized angle is the common choice in its tutorials.)
 
 Reads the data root only. Outputs go to ``gradients/<atlas>/`` in this repo:
+    brainjepa_ukb.csv             (N, G), Brain-JEPA's UKB gradients (tracked in git, not written here)
     group_<tag>.npy               (N, G)
     runs/<run_id>.npy             (N, G), one per run (subject version)
 
@@ -34,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from positional_embedding import load_gradients
 from rsfm.preprocessing.atlas import Atlas, prepare_atlas, parcellate
 from rsfm.preprocessing.inventory import load_manifest
 from rsfm.preprocessing.voxel_store import VoxelRun, is_done, load_grid
@@ -44,6 +53,16 @@ CACHE_DIR = REPO / "cache"              # local atlas copy until the atlas step 
 GRADIENT_DIR = REPO / "gradients"
 ATLAS_NAME = "tianS3_schaefer400n17"     # Brain-JEPA's layout: Tian S3 (50) then Schaefer-400 17N
 PLACEHOLDER_SUBJECT = "100206"
+DEFAULT_GROUP_GRADIENTS = "brainjepa_ukb"
+
+
+def group_gradient_path(source: str = DEFAULT_GROUP_GRADIENTS, atlas: str = ATLAS_NAME) -> Path:
+    """Path of the (N, G) group gradients: ``"brainjepa_ukb"`` (default) or an HCP tag such as
+    ``"placeholder"`` or ``"train"`` (``group_<tag>.npy``). Load it with
+    ``positional_embedding.load_gradients``."""
+    if source == "brainjepa_ukb":
+        return GRADIENT_DIR / atlas / "brainjepa_ukb.csv"
+    return GRADIENT_DIR / atlas / f"group_{source}.npy"
 
 
 def load_atlas(name: str = ATLAS_NAME, data_root: Path = DATA_ROOT, cache_dir: Path = CACHE_DIR) -> Atlas:
@@ -108,6 +127,10 @@ def diffusion_mapping(affinity: np.ndarray, n_components: int = 30, alpha: float
     row-normalized (non-symmetric) transition matrix P = D^-1 A; here we use its symmetric
     conjugate D^-1/2 A D^-1/2 (same eigenvalues, eigenvectors mapped back by D^-1/2), which
     gives the same embedding with a symmetric eigensolver.
+
+    Cross-checked against BrainSpace 0.3.0 on sub-100206's FC: |corr| >= 0.9994 per component.
+    The small difference is BrainSpace's: it runs the symmetric solver ``eigsh`` on the
+    non-symmetric P, so its vectors are approximate (eigen-residual 5e-3 vs 5e-16 here).
     """
     a = affinity.astype(np.float64)
     if alpha > 0:                                                # anisotropic normalization
@@ -197,7 +220,7 @@ def main(argv=None):
             fcs[row["run_id"]] = run_fc(DATA_ROOT, row, atlas)
         return fcs[row["run_id"]]
 
-    group_path = out_dir / f"group_{args.tag}.npy"
+    group_path = group_gradient_path(args.tag, args.atlas)
     if args.group:
         grad = group_gradients([fc_of(row) for _, row in group_runs.iterrows()], args.n_components)
         np.save(group_path, grad.astype(np.float32))
@@ -205,7 +228,7 @@ def main(argv=None):
 
     if args.subject:
         ref_path = args.reference or group_path
-        reference = np.load(ref_path).astype(np.float64)
+        reference = load_gradients(ref_path).numpy().astype(np.float64)
         for _, row in subject_runs.iterrows():
             grad = subject_gradients(fc_of(row), reference)
             np.save(out_dir / "runs" / f"{row['run_id']}.npy", grad.astype(np.float32))
