@@ -33,9 +33,16 @@ What exists in this repo and what is left to do. Update it at the end of every s
   - affinity and Procrustes match exactly;
   - the diffusion map matches at |corr| ≥ 0.9994 per component. Ours is the exact eigen-solution; BrainSpace runs a symmetric solver on a non-symmetric matrix.
   - `test_matches_brainspace` keeps this checked.
-- `tests/test_temporal_bit.py` (29 tests; 39 in total with preprocessing, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
+- `tests/test_temporal_bit.py` (29 tests; 43 in total with preprocessing and the dataloader, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
   - The tokenizer tests run for both voxel-embedding variants. One test checks that a full-rank table set to `codes @ W_up` gives exactly the low-rank output.
   - CPU only so far, B = 8 forward/backward: full rank 16.5 s, peak process memory 9.4 GiB; low rank (r = 64) 18 s, 8.9 GiB.
+
+### JEPA pretraining (slide 2)
+- `window_dataset.py`: `WindowDataset` cuts T-TR windows from the stored runs. Each item is a dict `x (T, V)` float16, `valid (V,)`, `tr`, `run`, `start`, and the default collate gives the model's inputs directly.
+  - Runs: stored, at least T TRs long, `exclude` runs skipped by default, optional `subjects` list for a split.
+  - `mode="random"` (training): n_tr // T windows per run per epoch, each at a random start. `mode="grid"` (validation): fixed starts every `stride` TRs.
+  - No normalization: the stored data is already z-scored per voxel.
+  - Tested on synthetic runs (`tests/test_window_dataset.py`, 4 tests). On the real data root it finds sub-100206's 2 runs (120 windows); 4 workers read them in 1.2 s, and a batch runs through the model.
 
 ## To do
 
@@ -52,10 +59,10 @@ What exists in this repo and what is left to do. Update it at the end of every s
 - [ ] Only if version 2 is used: choose a leak option and, if needed, add "gradients from another run of the same subject".
 - [ ] Only if profiling shows the need: speed up the tokenizer by grouping ROIs by size.
 
-### JEPA pretraining (slide 2), not started
-- [ ] A dataloader that cuts T = 20 windows from the stored runs and returns `(x, valid, tr)`.
+### JEPA pretraining (slide 2)
 - [ ] A mask sampler for hidden ROIs: first read Brain-JEPA's `src/masks/spatialtemporal_multiblock.py` and copy its ratios.
 - [ ] A predictor (mask token + gradient positional embedding), an EMA target encoder (`roi_keep=None`), the loss and the training loop. Use the group gradients.
+- [ ] Optional: skip or down-weight high-motion windows using the stored per-TR FD (`qc/*_fd.npy`); the dataloader does not use it yet.
 - [ ] Later: cross-time targets from several windows of the same scan (the minute grid in slide 2).
 
 ## Open decisions
