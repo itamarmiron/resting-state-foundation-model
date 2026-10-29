@@ -15,6 +15,11 @@ embeddings modulated by the activation, pooled by torch_geometric ``TransformerC
 "centers"), re-derived here for one shared MNI voxel space and without materializing the
 (B, T, V, d) modulated voxels. See ``BrainTokenizer`` for the algebra.
 
+Voxel embeddings: by default each labelled voxel has its own free d-dim embedding, as in Brain-IT
+(whose table is (sum of subjects' voxels, 1024), full rank). ``voxel_rank=r`` instead factorizes the
+table as codes (V', r) @ W_up (r, d), our addition: ~8x fewer parameters, but all voxel embeddings
+then share one r-dim subspace.
+
 ROI masking: ``roi_keep`` selects the ROIs to encode. Dropped ROIs are removed completely (their
 voxels are never read, they get no temporal pass and no token), and nothing mixes information
 across ROIs before the spatial transformer.
@@ -41,7 +46,8 @@ class TemporalBITConfig:
     tr: float = 0.72                # default TR (s) when forward() gets no ``tr``
     tr_ref: float = 0.72            # temporal PE position = t * TR / tr_ref
     d_model: int = 512              # d, width of voxel/ROI tokens in all three stages
-    voxel_rank: int = 64            # r, voxel embedding = codes (V', r) @ (r, d)
+    voxel_rank: int | None = None   # None: free (V', d) voxel embeddings (Brain-IT);
+                                    # r: low rank, codes (V', r) @ W_up (r, d)
     temporal_depth: int = 2
     temporal_heads: int = 8
     temporal_pool: str = "attn"     # "attn" (learned query) or "mean"
@@ -190,18 +196,22 @@ class BrainTokenizer(nn.Module):
     """Pool each ROI's voxels into one token per TR with single-head graph attention.
 
     For ROI r with voxels j in r (V2ROI) and activation a_tj at TR t:
-        e_j     = W_up z_j                              voxel embedding, low rank (z_j in R^r)
+        e_j     = voxel embedding, one per labelled voxel, shared by all subjects and TRs:
+                  a free row of voxel_embed (V', d), or W_up z_j if low rank (z_j in R^r)
         q_r     = W_q u_r                               u_r = learned ROI embedding (N x d)
         s_tj    = q_r . W_k (a_tj e_j) / sqrt(d)        key of the modulated voxel a_tj e_j
                 = a_tj * c_j,   c_j = q_r . W_k e_j / sqrt(d)
         alpha_t = softmax_{j in r}(s_tj)
         tok_tr  = W_v sum_j alpha_tj a_tj e_j + W_root u_r
-                = W_v W_up (sum_j alpha_tj a_tj z_j) + W_root u_r
+               (= W_v W_up (sum_j alpha_tj a_tj z_j) + W_root u_r if low rank)
     Keys and values are linear in the scalar activation, so the per-voxel coefficient c_j is
-    computed once per forward and each TR only needs a softmax over scalars and an r-dimensional
-    weighted sum per ROI. This is BIT's TransformerConv (heads=1, root_weight=True); the key and
-    value biases are dropped because a key bias cancels in the softmax and a value bias is a
-    constant offset.
+    computed once per forward and each TR only needs a softmax over scalars and a weighted sum
+    of embeddings per ROI (r-dimensional if low rank). This is BIT's TransformerConv (heads=1,
+    root_weight=True); the key and value biases are dropped because a key bias cancels in the
+    softmax and a value bias is a constant offset.
+
+    Full-rank memory: the padded (N, P, d) embedding block (~0.9 GB fp32 for the HCP atlas) is
+    built once per forward and shared by the batch, never gathered per sample.
 
     No LayerNorm is applied to the modulated voxels: LN(a * e) = sign(a) * LN(e) would erase the
     activation magnitude. The ROI token is normalized after pooling.
@@ -210,13 +220,17 @@ class BrainTokenizer(nn.Module):
     def __init__(self, cfg: TemporalBITConfig, v2roi: V2ROI):
         super().__init__()
         d, r = cfg.d_model, cfg.voxel_rank
-        self.d_model, self.n_voxels = d, v2roi.n_voxels
+        self.d_model, self.n_voxels, self.n_rois = d, v2roi.n_voxels, v2roi.n_rois
+        self.low_rank = r is not None
         self.register_buffer("pad_index", v2roi.pad_index, persistent=False)   # (N, P)
         self.register_buffer("pad_row", v2roi.pad_row, persistent=False)       # (N, P)
         self.register_buffer("pad_mask", v2roi.pad_mask, persistent=False)     # (N, P)
 
-        self.voxel_codes = nn.Parameter(torch.randn(v2roi.n_labelled, r))      # z, (V', r)
-        self.voxel_up = nn.Linear(r, d, bias=False)                            # W_up
+        if self.low_rank:
+            self.voxel_codes = nn.Parameter(torch.randn(v2roi.n_labelled, r))  # z, (V', r)
+            self.voxel_up = nn.Linear(r, d, bias=False)                        # W_up
+        else:
+            self.voxel_embed = nn.Parameter(cfg.init_std * torch.randn(v2roi.n_labelled, d))  # e, (V', d)
         self.roi_embed = nn.Parameter(cfg.init_std * torch.randn(v2roi.n_rois, d))  # u, (N, d)
         self.q = nn.Linear(d, d, bias=False)
         self.k = nn.Linear(d, d, bias=False)
@@ -236,11 +250,14 @@ class BrainTokenizer(nn.Module):
             idx   = pad_index[roi_keep]                    (B, K, P)   voxel ids of kept ROIs only
             a     = x gathered at idx                      (B, T, K, P)
             real  = pad_mask & voxel_valid                 (B, K, P)
-            z     = voxel_codes[pad_row[roi_keep]]         (B, K, P, r)
-            c     = z . (W_up^T W_k^T W_q u)  / sqrt(d)    (B, K, P)
+            c     = e . (W_k^T W_q u) / sqrt(d)            (B, K, P)
             alpha = softmax_P(a * c), masked by real       (B, T, K, P)
-            h     = sum_P alpha * a * z                    (B, T, K, r)
-            tok   = LN(W_v W_up h + W_root u)              (B, T, K, d)
+            h     = sum_P alpha * a * e                    (B, T, K, d)
+            tok   = LN(W_v h + W_root u)                   (B, T, K, d)
+        Full rank: e = voxel_embed[pad_row] is (N, P, d), shared by the batch; c is computed for
+        all N ROIs and h by scattering the kept weights into N slots (dropped ROIs stay 0).
+        Low rank: z = voxel_codes[pad_row[roi_keep]] is (B, K, P, r), c = z . (W_up^T W_k^T W_q u)
+        and h = W_up sum_P alpha * a * z, so nothing d-wide is built per voxel.
         """
         B, T, V = x.shape
         K = roi_keep.shape[1]
@@ -258,10 +275,15 @@ class BrainTokenizer(nn.Module):
             valid_ext = torch.cat([voxel_valid, voxel_valid.new_zeros(B, 1)], dim=1)   # (B, V + 1)
             real = real & torch.gather(valid_ext, 1, idx.reshape(B, K * P)).reshape(B, K, P)
 
-        z = self.voxel_codes[self.pad_row[roi_keep]]                            # (B, K, P, r)
         u = self.roi_embed[roi_keep]                                            # (B, K, d)
-        q_code = self.q(u) @ self.k.weight @ self.voxel_up.weight              # (B, K, r)
-        c = torch.einsum("bkpr,bkr->bkp", z, q_code) / self.d_model ** 0.5      # (B, K, P)
+        if self.low_rank:
+            z = self.voxel_codes[self.pad_row[roi_keep]]                        # (B, K, P, r)
+            q_code = self.q(u) @ self.k.weight @ self.voxel_up.weight          # (B, K, r)
+            c = torch.einsum("bkpr,bkr->bkp", z, q_code) / self.d_model ** 0.5  # (B, K, P)
+        else:
+            e = self.voxel_embed[self.pad_row]                                  # (N, P, d)
+            q_key = self.q(self.roi_embed) @ self.k.weight                      # (N, d)
+            c = torch.einsum("npd,nd->np", e, q_key)[roi_keep] / self.d_model ** 0.5  # (B, K, P)
 
         scores = a * c[:, None]                                                 # (B, T, K, P)
         scores = scores.masked_fill(~real[:, None], float("-inf"))
@@ -271,8 +293,15 @@ class BrainTokenizer(nn.Module):
         scores = scores.masked_fill(empty[:, None, :, None], 0.0)
         alpha = torch.softmax(scores, dim=-1) * real[:, None]                   # (B, T, K, P)
 
-        h = torch.einsum("btkp,bkpr->btkr", alpha * a, z)                       # (B, T, K, r)
-        tok = self.v(self.voxel_up(h)) + self.root(u)[:, None]                 # (B, T, K, d)
+        w = alpha * a                                                           # (B, T, K, P)
+        if self.low_rank:
+            h = self.voxel_up(torch.einsum("btkp,bkpr->btkr", w, z))           # (B, T, K, d)
+        else:
+            slots = roi_keep[:, None, :, None]                                  # (B, 1, K, 1)
+            w_all = w.new_zeros(B, T, self.n_rois, P).scatter(2, slots.expand(B, T, K, P), w)
+            h_all = torch.einsum("btnp,npd->btnd", w_all, e)                    # (B, T, N, d)
+            h = torch.gather(h_all, 2, slots.expand(B, T, K, self.d_model))    # (B, T, K, d)
+        tok = self.v(h) + self.root(u)[:, None]                                 # (B, T, K, d)
         tok = self.norm(tok)
         assert tok.shape == (B, T, K, self.d_model)
         return tok

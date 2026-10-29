@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pytest
 import torch
@@ -7,6 +9,7 @@ from positional_embedding import load_gradients
 from temporal_bit import TemporalBIT, TemporalBITConfig, build_v2roi
 
 N_ROIS, N_VOX, G = 5, 80, 6
+RANKS = pytest.mark.parametrize("rank", [None, 8])     # full-rank voxel embeddings, low rank
 
 
 def make_atlas(seed: int = 0) -> np.ndarray:
@@ -17,8 +20,8 @@ def make_atlas(seed: int = 0) -> np.ndarray:
     return labels
 
 
-def make_model(T: int = 20, source: str = "group", **kw) -> TemporalBIT:
-    cfg = TemporalBITConfig(n_timepoints=T, d_model=32, voxel_rank=8, temporal_depth=1, temporal_heads=4,
+def make_model(T: int = 20, source: str = "group", rank: int | None = None, **kw) -> TemporalBIT:
+    cfg = TemporalBITConfig(n_timepoints=T, d_model=32, voxel_rank=rank, temporal_depth=1, temporal_heads=4,
                             spatial_depth=2, spatial_heads=4, out_dim=16, grad_dim=G,
                             gradient_source=source, **kw)
     torch.manual_seed(0)
@@ -38,10 +41,11 @@ def test_v2roi_padding():
     assert (labelled[v.pad_row[v.pad_mask]] == v.pad_index[v.pad_mask].numpy()).all()
 
 
+@RANKS
 @pytest.mark.parametrize("T", [7, 20])
 @pytest.mark.parametrize("pool", ["attn", "mean"])
-def test_shapes(T, pool):
-    model = make_model(T, temporal_pool=pool)
+def test_shapes(T, pool, rank):
+    model = make_model(T, temporal_pool=pool, rank=rank)
     x = torch.randn(3, T, N_VOX).half()
     out, mid = model(x, return_intermediates=True)
     assert out.shape == (3, N_ROIS, 16)
@@ -59,16 +63,18 @@ def test_subject_gradients_shapes_and_required():
         model(x)
 
 
-def test_keep_all_equals_none():
-    model = make_model()
+@RANKS
+def test_keep_all_equals_none(rank):
+    model = make_model(rank=rank)
     x = torch.randn(2, 20, N_VOX)
     assert torch.allclose(model(x), model(x, roi_keep=torch.arange(N_ROIS)), atol=1e-6)
 
 
+@RANKS
 @pytest.mark.parametrize("source", ["group", "subject"])
-def test_dropped_roi_has_no_influence(source):
+def test_dropped_roi_has_no_influence(source, rank):
     """Changing the voxels of a dropped ROI must not change anything."""
-    model = make_model(source=source)
+    model = make_model(source=source, rank=rank)
     labels = make_atlas()
     keep = torch.tensor([[0, 2, 4], [1, 2, 3]])
     grads = torch.randn(2, N_ROIS, G)
@@ -82,9 +88,10 @@ def test_dropped_roi_has_no_influence(source):
     assert torch.equal(out, out2)
 
 
-def test_no_cross_roi_mixing_before_spatial():
+@RANKS
+def test_no_cross_roi_mixing_before_spatial(rank):
     """Perturbing ROI j changes only ROI j's token up to the spatial transformer."""
-    model = make_model()
+    model = make_model(rank=rank)
     labels = make_atlas()
     x = torch.randn(1, 20, N_VOX)
     x2 = x.clone()
@@ -98,8 +105,9 @@ def test_no_cross_roi_mixing_before_spatial():
         assert not torch.allclose(mid[key][..., 2, :], mid2[key][..., 2, :])
 
 
-def test_invalid_voxels_masked_and_empty_roi_no_nan():
-    model = make_model().train()
+@RANKS
+def test_invalid_voxels_masked_and_empty_roi_no_nan(rank):
+    model = make_model(rank=rank).train()
     labels = make_atlas()
     x = torch.randn(2, 20, N_VOX, requires_grad=True)
     valid = torch.ones(2, N_VOX, dtype=torch.bool)
@@ -114,6 +122,27 @@ def test_invalid_voxels_masked_and_empty_roi_no_nan():
         x2 = x.detach().clone()
         x2[0][:, torch.from_numpy(labels == 2)] = 100.0
         assert torch.equal(model(x.detach(), voxel_valid=valid), model(x2, voxel_valid=valid))
+
+
+def test_voxel_embedding_tables():
+    n_labelled = int((make_atlas() > 0).sum())
+    full, low = make_model().tokenizer, make_model(rank=8).tokenizer
+    assert full.voxel_embed.shape == (n_labelled, 32) and not hasattr(full, "voxel_codes")
+    assert low.voxel_codes.shape == (n_labelled, 8) and not hasattr(low, "voxel_embed")
+
+
+def test_full_rank_matches_low_rank_with_same_embeddings():
+    """A full-rank table set to codes @ W_up^T gives the low-rank model's output."""
+    low, full = make_model(rank=8), make_model()
+    state = {k: v for k, v in low.state_dict().items() if "voxel_codes" not in k and "voxel_up" not in k}
+    state["tokenizer.voxel_embed"] = low.tokenizer.voxel_codes @ low.tokenizer.voxel_up.weight.T
+    full.load_state_dict(state)
+    x = torch.randn(2, 20, N_VOX)
+    keep = torch.tensor([[0, 2, 4], [1, 3, 4]])
+    valid = torch.rand(2, N_VOX) > 0.2
+    with torch.no_grad():
+        assert torch.allclose(full(x, roi_keep=keep, voxel_valid=valid),
+                              low(x, roi_keep=keep, voxel_valid=valid), atol=1e-5)
 
 
 def test_gradient_pe_unchanged_by_masking():

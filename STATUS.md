@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-26
+Last updated: 2026-10-29
 
 What exists in this repo and what is left to do. Update it at the end of every session that changes anything (see CLAUDE.md).
 
@@ -14,8 +14,10 @@ What exists in this repo and what is left to do. Update it at the end of every s
 
 ### Temporal BIT encoder (slide 1 of `Temporal_BIT_JEPA_widescreen.pdf`)
 - `temporal_bit.py`: `TemporalBITConfig` (T = 20 by default), `BrainTokenizer`, `TemporalTransformer`, `SpatialTransformer`, `TemporalBIT`.
-  - `(B, T, V)` → `(B, T, N, 512)` → `(B, N, 512)` → `(B, N, D)`; 39 M parameters.
-  - Voxel embeddings are low rank (64), one per labelled MNI voxel.
+  - `(B, T, V)` → `(B, T, N, 512)` → `(B, N, 512)` → `(B, N, D)`; 102 M parameters, of which 72 M are the voxel embeddings.
+  - Voxel embeddings: one per labelled MNI voxel (V′ = 140,526), shared across subjects and TRs.
+    - Default `voxel_rank=None`: a free 512-dim row per voxel, as in Brain-IT. This was checked against `brainit-fmri/models/decoder_models.py`: Brain-IT uses a full-rank `(voxels, 1024)` table, but with separate rows per subject.
+    - Optional `voxel_rank=r`: our own low-rank version, codes `(V′, r)` @ shared `W_up (r, 512)`. With r = 64 it has 39 M parameters in total. Kept to test later.
   - The tokenizer never builds a `(B, T, V, d)` tensor.
   - Invalid voxels are masked.
   - `roi_keep` removes ROIs completely; tested to leave no influence and to mix no ROIs before the spatial stage.
@@ -31,8 +33,9 @@ What exists in this repo and what is left to do. Update it at the end of every s
   - affinity and Procrustes match exactly;
   - the diffusion map matches at |corr| ≥ 0.9994 per component. Ours is the exact eigen-solution; BrainSpace runs a symmetric solver on a non-symmetric matrix.
   - `test_matches_brainspace` keeps this checked.
-- `tests/test_temporal_bit.py` (18 tests; 28 in total with preprocessing, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
-  - CPU only so far: a B = 8 forward/backward took 18 s with a peak process memory of 8.9 GiB.
+- `tests/test_temporal_bit.py` (29 tests; 39 in total with preprocessing, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
+  - The tokenizer tests run for both voxel-embedding variants. One test checks that a full-rank table set to `codes @ W_up` gives exactly the low-rank output.
+  - CPU only so far, B = 8 forward/backward: full rank 16.5 s, peak process memory 9.4 GiB; low rank (r = 64) 18 s, 8.9 GiB.
 
 ## To do
 
@@ -44,7 +47,8 @@ What exists in this repo and what is left to do. Update it at the end of every s
 - [ ] Later, to compare with UKB: compute the HCP group gradients: `compute_gradients.py --group --train-subjects <file>`. If version 2 is used, also compute the per-run gradients (`--subject`).
 
 ### Encoder leftovers
-- [ ] Measure GPU memory and speed with the smoke test on a GPU that is visible. This session had `CUDA_VISIBLE_DEVICES` set to empty.
+- [ ] Measure GPU memory and speed with the smoke test on a GPU that is visible. The 2026-10-29 session also had `CUDA_VISIBLE_DEVICES` set to empty, even though `nvidia-smi` lists an L40S.
+- [ ] Later: compare full-rank voxel embeddings (default) with low rank (`voxel_rank=64` or other r) once pretraining runs.
 - [ ] Only if version 2 is used: choose a leak option and, if needed, add "gradients from another run of the same subject".
 - [ ] Only if profiling shows the need: speed up the tokenizer by grouping ROIs by size.
 
@@ -59,4 +63,5 @@ What exists in this repo and what is left to do. Update it at the end of every s
 - The train/test split.
 - Gradients: UKB (Brain-JEPA) for now. Later, test HCP group gradients and per-subject gradients (and which leak option) against it.
 - When to move from T = 20 (14.4 s) to the slide-2 "minute" (≈ 83 TRs).
+- Voxel embeddings: full rank (default, as in Brain-IT) or low rank (`voxel_rank`). Decide after comparing them in pretraining.
 - Adding the cerebellum later: this changes N, the voxel embeddings and the gradients.
