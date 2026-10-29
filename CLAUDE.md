@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 resting-state-foundation-model — the goal of this project is to develop a new foundation model for resting-state fMRI.
 
-There is a preprocessing package (`rsfm/preprocessing/`), the Temporal BIT encoder (top-level `temporal_bit.py`, `positional_embedding.py`, `compute_gradients.py`) and its window dataloader (`window_dataset.py`). The rest of the JEPA pretraining (slide 2 of `Temporal_BIT_JEPA_widescreen.pdf`: mask sampler, predictor, training loop) is not written yet.
+There is a preprocessing package (`rsfm/preprocessing/`), the Temporal BIT encoder (top-level `temporal_bit.py`, `positional_embedding.py`, `compute_gradients.py`) its window dataloader (`window_dataset.py`) and the ROI masks for pretraining (`roi_masks.py`). The rest of the JEPA pretraining (slide 2 of `Temporal_BIT_JEPA_widescreen.pdf`: predictor, EMA target encoder, loss, training loop) is not written yet.
 
 ## Environment and commands
 
