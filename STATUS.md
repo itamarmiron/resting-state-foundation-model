@@ -9,13 +9,16 @@ What exists in this repo and what is left to do. Update it at the end of every s
 ### Preprocessing (`rsfm/preprocessing/`)
 - CLI steps `inventory` → `mask` → `run` → optional `atlas` / `parcellate`, with unit tests (`tests/test_preprocessing.py`). Design: `docs/PREPROCESSING_PLAN.md`.
 - HCP so far:
-  - `manifest.tsv` (807 runs) and the frozen group mask (`grid/`, V = 234,961 voxels) exist.
-  - Only **sub-100206 ses-1 (LR, RL)** is processed. The full processing run has **not** started, and the HCP download is still in progress.
+  - The upstream run (download + fMRIPrep, `HCP_1200/jobs/full/STATUS.md`) is still in progress: 681 / 1,096 subjects on 2026-11-01. It runs by itself; this repo only reads its `status.tsv`.
+  - **Interim split** `splits/hcp_interim_v1*` (seed 0, stratified by complete/partial): train 876, val 110, test 110, over all 1,096 subjects with rest data, processed or not. **It ignores families, so relatives can be in different sets and results are provisional** (see To do).
+  - **Group mask rebuilt 2026-11-01** from the 546 train subjects with finished fMRIPrep (2,103 runs): V = 235,026, was 234,961 (83 voxels added, 18 removed). Frozen. The old mask, manifest and 2 stored runs are in `rsfm_voxel/archive_pre_split_20261101/`.
+  - **Denoising manager started 2026-11-01** on the user's go-ahead; live progress is in `PREPROCESSING_STATUS.md`, so counts in this file go stale. `scripts/preprocess_manager.sbatch` (`irani_run.q`) submits `scripts/preprocess_subject.sbatch` workers (`irani_risk.q`, up to 8) as fMRIPrep finishes subjects. Live table: `PREPROCESSING_STATUS.md` (generated, not in git).
+  - Tested on real data, 2 subjects stored (100206 train, 100307 val; 8 runs): about 2–3 min per subject (40–50 s per run). `sacct` MaxRSS 18–28 GiB, though the worker's own peak is 8.5 GiB; the job limit is 40 GB. Voxels z-scored (std 1.000), invalid voxels 0. Cancelling a worker mid-subject and resubmitting it skipped the finished run.
 
 ### Temporal BIT encoder (slide 1 of `Temporal_BIT_JEPA_widescreen.pdf`)
 - `temporal_bit.py`: `TemporalBITConfig` (T = 20 by default), `BrainTokenizer`, `TemporalTransformer`, `SpatialTransformer`, `TemporalBIT`.
   - `(B, T, V)` → `(B, T, N, 512)` → `(B, N, 512)` → `(B, N, D)`; 102 M parameters, of which 72 M are the voxel embeddings.
-  - Voxel embeddings: one per labelled MNI voxel (V′ = 140,526), shared across subjects and TRs.
+  - Voxel embeddings: one per labelled MNI voxel (V′ = 140,535), shared across subjects and TRs.
     - Default `voxel_rank=None`: a free 512-dim row per voxel, as in Brain-IT. This was checked against `brainit-fmri/models/decoder_models.py`: Brain-IT uses a full-rank `(voxels, 1024)` table, but with separate rows per subject.
     - Optional `voxel_rank=r`: our own low-rank version, codes `(V′, r)` @ shared `W_up (r, 512)`. With r = 64 it has 39 M parameters in total. Kept to test later.
   - The tokenizer never builds a `(B, T, V, d)` tensor.
@@ -58,37 +61,43 @@ What exists in this repo and what is left to do. Update it at the end of every s
   - One deviation: it is always in eval mode, so targets stay deterministic if dropout is enabled.
   - Tested in `tests/test_ema_target_encoder.py` (8 tests).
 - The encoder, predictor and target encoder ran together for one step on real sub-100206 windows, with a throwaway MSE loss and SGD (full-size model, B = 4, 163 context and 265 target ROIs, CPU): finite outputs, 7.8 s, peak process memory 4.7 GiB. This is a wiring check, not the real loss or a training run.
+- `train_jepa.py` (config `configs/pretraining/hcp.yaml`, tests `tests/test_train_jepa.py`): smooth L1 loss, AdamW, gradient accumulation (8 × B = 16), LR warmup + cosine and cosine weight decay, all as in Brain-JEPA and counted in optimizer steps; the schedules match Brain-JEPA's code exactly. Saves `latest.pt` every 500 optimizer steps and resumes from it.
+  - Deviations: EMA momentum counts optimizer steps so it reaches 1.0 (Brain-JEPA stops near 0.9965 at 8 accumulation steps); no GradScaler with bf16; non-finite losses stop the run; one GPU only. bf16 applies on GPU only, since CPU autocast rejects float16 input.
+- GPU memory measured on an H200 (2026-11-01, Slurm job 324659): full JEPA steps with AdamW on random data, 190 context and 240 target ROIs, excluding data loading. Peak allocated GiB and s/step:
+  - fp32, T = 20: B = 16 10.1 GiB, 0.39 s; B = 64 32.9 GiB, 0.91 s.
+  - fp32, T = 83: B = 16 28.7 GiB, 0.82 s; B = 32 54.8 GiB, 1.43 s.
+  - bf16, T = 83: B = 16 19.6 GiB, 0.41 s; B = 32 36.7 GiB, 0.60 s.
+  - Attention backend at T = 83, B = 16: flash and PyTorch's memory-efficient kernel have the same peak; plain matmul + softmax costs 2.4 GiB more in fp32 and 3.1 GiB more in bf16. Our current `scaled_dot_product_attention` is already at the low end, so we keep it.
+  - Low rank (r = 64) saves only 1.6–3.3 GiB and ran about 2–4x slower per step.
 
 ## To do
 
-### Data (blocked on the download or on decisions)
-- [ ] The HCP download finishes, then the full processing run (`sbatch scripts/preprocess_hcp.sbatch`). This needs the user's explicit go-ahead.
-- [ ] Decide whether the frozen group mask is final. It must not change after training starts, because V, the stored runs and the voxel embeddings all depend on it.
+### Data
+- [ ] Denoising finishes (running; follows fMRIPrep until all 1,096 subjects are done). FAILED subjects need a human: see `PREPROCESSING_STATUS.md`. The manager is `squeue -u $USER -n rsfm_manager`; restart it with `sbatch scripts/preprocess_manager.sbatch` if it stops with work left.
+- [ ] **Future: get the HCP restricted CSV (`Family_ID`) and replace the interim split with a family-aware one**, as a new split version. Keep the restricted file out of git. All subjects are stored regardless of set, so no denoised data is lost. The frozen mask keeps a small trace of train subjects who move out; that was accepted.
 - [ ] Optional: run the `atlas` step on the data root, which adds one ~1 MB folder (needs approval).
-- [ ] Define the train/test subject split.
 - [ ] Later, to compare with UKB: compute the HCP group gradients: `compute_gradients.py --group --train-subjects <file>`. If version 2 is used, also compute the per-run gradients (`--subject`).
 
 ### Encoder leftovers
-- [ ] Measure GPU memory and speed with the smoke test on a GPU that is visible. The 2026-10-29 session also had `CUDA_VISIBLE_DEVICES` set to empty, even though `nvidia-smi` lists an L40S.
 - [ ] Later: compare full-rank voxel embeddings (default) with low rank (`voxel_rank=64` or other r) once pretraining runs.
 - [ ] Only if version 2 is used: choose a leak option and, if needed, add "gradients from another run of the same subject".
 - [ ] Only if profiling shows the need: speed up the tokenizer by grouping ROIs by size.
+- [ ] Potential: pivot to Brain-IT's attention implementation (xFormers `memory_efficient_attention`, `models/layers_transformer.py` in `brainit-fmri`; Brain-IT pins `xformers==0.0.22.post7`). Not needed for memory so far: the measured PyTorch kernels already match the most efficient case, but xFormers itself is untested here. Check first that it works with torch 2.1.2+cu121 and how the CPU tests would run.
 
 ### JEPA pretraining (slide 2)
-- [ ] The loss and the training loop (optimizer, LR and weight-decay schedules, checkpoints).
+- [ ] **Investigate possible representation collapse before any long run.** In a 100-step check on one subject (240 windows, job 324762), `target_std` fell 0.56 → 0.058, `pred_std` 0.28 → 0.036 and the loss 0.13 → 0.001. So few data may exaggerate this, but it is what collapse looks like. Check on more subjects, and compare with the settings (LR, EMA momentum, predictor).
+- [ ] A long training run needs a fixed `subjects_file`: `train_jepa.py` refuses to resume if the dataset size changed, and it grows while denoising runs.
+- [ ] Measure data-loading throughput and host RAM on real data with many workers. A T = 83, B = 16 batch is 624 MB, so at 0.4 s/step this is the likelier bottleneck.
 - [ ] Decide the masking ratios and sampling method (see Open decisions), then finalize `roi_masks.py`.
 - [ ] Optional: skip or down-weight high-motion windows using the stored per-TR FD (`qc/*_fd.npy`); the dataloader does not use it yet.
 - [ ] Later: cross-time targets from several windows of the same scan (the minute grid in slide 2): the "T" and "D" masks, in `roi_masks.py` next to the "R" masks.
 
 ## Open decisions
-- Is the group mask final?
-- The train/test split.
 - Gradients: UKB (Brain-JEPA) for now. Later, test HCP group gradients and per-subject gradients (and which leak option) against it.
 - When to move from T = 20 (14.4 s) to the slide-2 "minute" (≈ 83 TRs).
 - **Future decision: masking ratios and sampling method.** `roi_masks.py` currently uses Brain-JEPA's values as placeholders. Still open:
   - the target fraction (now 45–60 %);
   - the context size: Brain-JEPA's (`context_scale=(0.84, 1.0)`, the default) or slide 2's, where every non-target ROI is visible (`context_scale=(1, 1)`);
   - how ROIs are sampled (now uniformly random, not contiguous or network-based).
-- Loss: Brain-JEPA's smooth L1 or slide 2's L2.
 - Voxel embeddings: full rank (default, as in Brain-IT) or low rank (`voxel_rank`). Decide after comparing them in pretraining.
 - Adding the cerebellum later: this changes N, the voxel embeddings and the gradients.

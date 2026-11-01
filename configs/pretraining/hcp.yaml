@@ -1,0 +1,25 @@
+# JEPA pretraining on HCP (train_jepa.py). Training values are Brain-JEPA's configs/ukb_vitb_ep300.yaml.
+data_root: /net/mraid16/mnt/pool-16/iranig_workspace/HCP_1200/derivatives/rsfm_voxel
+output_dir: runs/hcp_pretrain     # about 2 GB per checkpoint; latest.pt is replaced each time
+subjects_file: null               # set this once the train/test split exists
+
+batch_size: 16
+accumulation_steps: 8
+epochs: 300
+warmup_epochs: 40
+start_lr: 5.0e-5
+lr: 1.0e-3
+final_lr: 1.0e-6
+weight_decay: 0.04
+final_weight_decay: 0.4
+ema_start: 0.996
+ema_end: 1.0
+precision: bf16
+seed: 0
+num_workers: 8
+log_every: 10
+checkpoint_every: 500
+
+encoder: {}      # TemporalBITConfig overrides, e.g. n_timepoints
+predictor: {}    # PredictorConfig overrides
+mask: {}         # ROIMaskConfig overrides; the masking ratios and sampling are still undecided

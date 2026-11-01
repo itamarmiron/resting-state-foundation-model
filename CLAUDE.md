@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 resting-state-foundation-model — the goal of this project is to develop a new foundation model for resting-state fMRI.
 
-There is a preprocessing package (`rsfm/preprocessing/`), the Temporal BIT encoder (top-level `temporal_bit.py`, `positional_embedding.py`, `compute_gradients.py`) its window dataloader (`window_dataset.py`), and for JEPA pretraining the ROI masks (`roi_masks.py`), predictor (`predictor.py`) and EMA target encoder (`ema_target_encoder.py`). The rest of the pretraining (slide 2 of `Temporal_BIT_JEPA_widescreen.pdf`: loss, training loop) is not written yet. The predictor is a small ViT as in Brain-JEPA, on purpose, not the slide's "narrow BIT cross-transformer". The masking ratios and sampling method in `roi_masks.py` are placeholders until that decision is made.
+There is a preprocessing package (`rsfm/preprocessing/`), the Temporal BIT encoder (top-level `temporal_bit.py`, `positional_embedding.py`, `compute_gradients.py`) its window dataloader (`window_dataset.py`), and for JEPA pretraining the ROI masks (`roi_masks.py`), predictor (`predictor.py`), EMA target encoder (`ema_target_encoder.py`) and training loop (`train_jepa.py`), all for slide 2 of `Temporal_BIT_JEPA_widescreen.pdf`. The predictor is a small ViT as in Brain-JEPA, on purpose, not the slide's "narrow BIT cross-transformer". The masking ratios and sampling method in `roi_masks.py` are placeholders until that decision is made.
 
 ## Environment and commands
 
@@ -16,23 +16,29 @@ Use the existing conda env (nilearn 0.10.1, nibabel, scipy, pandas, pyyaml, torc
 PY=/home/itamarm/miniconda3/envs/py39/bin/python
 $PY -m pytest tests -q                                                      # unit tests (synthetic data)
 $PY -m rsfm.preprocessing.cli <step> --config configs/preprocessing/hcp.yaml   # steps below
-sbatch scripts/preprocess_hcp.sbatch                                        # full HCP denoising (job array)
+sbatch scripts/preprocess_manager.sbatch                                    # HCP denoising manager (long-running; submits workers)
+$PY -m rsfm.preprocessing.status <command>                                  # denoising status: reconcile, next, reset, show, render
+$PY train_jepa.py --config configs/pretraining/hcp.yaml [--max-steps N]     # JEPA pretraining, resumes from output_dir/latest.pt
 $PY compute_gradients.py --placeholder                                      # brain gradients from sub-100206 only
 $PY smoke_test_temporal_bit.py                                              # model shapes on random + real data
 ```
 
-Don't launch the full-dataset run unless the user asks for it explicitly.
+The denoising manager is running (started 2026-11-01 on the user's go-ahead); check `squeue -u $USER -n rsfm_manager` before starting another. Don't launch other full-dataset runs, such as long training, unless the user asks for it explicitly.
 
 ## Preprocessing
 
 Design and rationale: `docs/PREPROCESSING_PLAN.md`. The final output is **voxel data**; an atlas is an optional step applied to it afterwards.
 
-CLI steps, in order: `inventory` (writes `manifest.tsv`, one row per run) → `mask` (frozen group mask in `grid/`) → `run` (denoise and store voxels; resumable; shard with `--num-shards`) → optional `atlas --name schaefer400_tianS3` → optional `parcellate --name ...`.
+CLI steps, in order: `split` (subject sets in `splits/`) → `inventory` (writes `manifest.tsv`, one row per run) → `mask` (frozen group mask in `grid/`) → `run` (denoise and store voxels; resumable; shard with `--num-shards`) → optional `atlas --name schaefer400_tianS3` → optional `parcellate --name ...`.
+
+HCP denoising runs through a manager, not the CLI's `run`: `scripts/preprocess_manager.sbatch` (`irani_run.q`) submits one `scripts/preprocess_subject.sbatch` worker per subject (`irani_risk.q`) once the fMRIPrep run's `status.tsv` says DONE and collected. Machine state, settings (`manager.conf`), `STOP` and logs are in `rsfm_voxel/jobs/`; the generated, git-ignored table is `PREPROCESSING_STATUS.md`. The fMRIPrep run's files are read, never written.
 
 Things that aren't obvious from the code:
 - All data, the TemplateFlow Schaefer atlases and the Tian atlases are in MNI152NLin2009cAsym on the same 97×115×97, 2 mm grid. Nothing is resampled, and the code asserts the grids match. Don't use nilearn's FSL-space atlases.
 - Stored runs are `T × V` float16 over the group-mask voxels in C order (`volume[mask]`). The group mask is frozen once built: rebuilding it invalidates every stored run.
 - TR comes from the BOLD JSON sidecar; NIfTI headers can be wrong. Confounds are read from the TSV, and aCompCor columns are chosen by `Mask == "combined"` in its JSON. nilearn's `load_confounds` fails on `dir-` filenames.
+- `splits/hcp_interim_v1*` ignores families, so relatives can be in different sets; a family-aware version is a to-do. Splits are versioned and never overwritten. The group mask was built from train subjects only.
+- `manifest.tsv` grows as workers add subjects, so `WindowDataset` sees more data over time. `train_jepa.py` refuses to resume if the dataset size changes: pin a `subjects_file` for long runs.
 - High-motion runs are stored anyway: `exclude` in the manifest is a flag for consumers.
 - Tian atlas files are downloaded to `~/.cache/rsfm/atlases/tian` (override with `RSFM_TIAN_DIR`); Schaefer comes from `~/.cache/templateflow`.
 

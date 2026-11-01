@@ -5,10 +5,13 @@ not a deletion, so the motion threshold can change without reprocessing.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Iterable
 
 import nibabel as nib
 import numpy as np
@@ -68,10 +71,13 @@ def describe_run(bold: Path, fd_threshold: float) -> dict:
     return row
 
 
-def build_manifest(cfg: dict, n_workers: int = 16) -> pd.DataFrame:
-    bolds = sorted(cfg["fmriprep_dir"].glob(cfg["bold_glob"]))
+def build_manifest(cfg: dict, n_workers: int = 16, subjects: Iterable[str] | None = None) -> pd.DataFrame:
+    """Manifest rows for all runs in fmriprep_dir, or only those of ``subjects``."""
+    patterns = [cfg["bold_glob"]] if subjects is None else [
+        cfg["bold_glob"].replace("sub-*", f"sub-{s}", 1) for s in subjects]
+    bolds = sorted(b for pattern in patterns for b in cfg["fmriprep_dir"].glob(pattern))
     if not bolds:
-        raise FileNotFoundError(f"no BOLD files match {cfg['fmriprep_dir'] / cfg['bold_glob']}")
+        raise FileNotFoundError(f"no BOLD files match {cfg['fmriprep_dir'] / patterns[0]}")
     fd_threshold = cfg["qc"]["fd_threshold"]
     with ThreadPoolExecutor(n_workers) as pool:            # I/O bound: NFS reads
         rows = list(pool.map(lambda b: describe_run(b, fd_threshold), bolds))
@@ -84,10 +90,27 @@ def build_manifest(cfg: dict, n_workers: int = 16) -> pd.DataFrame:
 
 
 def save_manifest(df: pd.DataFrame, out_dir: Path) -> Path:
+    """Replaces the file atomically: jobs and dataloaders may be reading it."""
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / MANIFEST_NAME
-    df.to_csv(path, sep="\t", index=False)
+    tmp = path.with_name(f"{MANIFEST_NAME}.tmp.{os.getpid()}")
+    df.to_csv(tmp, sep="\t", index=False)
+    os.replace(tmp, path)
     return path
+
+
+def update_manifest(new_rows: pd.DataFrame, out_dir: Path) -> Path:
+    """Add or replace these runs in the manifest, under a lock: workers on other nodes do the same."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / f"{MANIFEST_NAME}.lock", "a+") as lock:
+        fcntl.lockf(lock, fcntl.LOCK_EX)
+        try:
+            if (out_dir / MANIFEST_NAME).exists():
+                old = load_manifest(out_dir)
+                new_rows = pd.concat([old[~old["run_id"].isin(new_rows["run_id"])], new_rows], ignore_index=True)
+            return save_manifest(new_rows.sort_values("run_id").reset_index(drop=True), out_dir)
+        finally:
+            fcntl.lockf(lock, fcntl.LOCK_UN)
 
 
 def load_manifest(out_dir: Path) -> pd.DataFrame:

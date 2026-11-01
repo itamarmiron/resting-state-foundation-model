@@ -10,7 +10,7 @@ file per TR).
 
 ```
 fMRIPrep derivatives
-  → preprocess.py (inventory → denoise → voxel store)   ══► VOXEL DATA (final output)
+  → rsfm.preprocessing (inventory → denoise → voxel store)   ══► VOXEL DATA (final output)
                                                               │
                                     optional, any time later  ▼
                          parcellate(voxel_run, atlas)  →  T × R parcel time series
@@ -25,10 +25,10 @@ fMRIPrep derivatives
 
 Input facts (checked 2026-10-20): fMRIPrep 25.2.5, `space-MNI152NLin2009cAsym_res-2`,
 grid 97×115×97 at 2 mm, not skull-stripped, TR 0.72 s, 1200 TRs per run, 2 runs (`dir-LR`,
-`dir-RL`) per session. 209 subjects / 799 runs present so far (the full fMRIPrep run is
-still in progress).
+`dir-RL`) per session. 1,096 subjects / 4,233 runs have rest data; the fMRIPrep run tracks its
+progress in `HCP_1200/jobs/full/STATUS.md`.
 
-## Part A — `preprocess.py` (output: voxel data)
+## Part A — `rsfm/preprocessing/` (output: voxel data)
 
 **A0. Inventory.** One manifest row per run (`manifest.tsv`): subject, session, dir, file paths, **TR from the
 `.json` sidecar** (NIfTI headers are unreliable), n_TR, mean FD, % high-motion volumes,
@@ -50,11 +50,10 @@ exclusion flag. Every later step reads the manifest. Exclusion is a flag, not a 
 - Native fMRIPrep grid (97×115×97, 2 mm, MNI152NLin2009cAsym). **No crop, no warp, no
   smoothing.**
 - One **group brain mask**: template brain mask ∩ voxels in-brain in ≥ 50% of runs (per-run
-  masks extend well outside the brain). Built once and **frozen**; runs added later reuse it.
-  Only in-mask voxels are stored (234,961 voxels for HCP).
+  masks extend well outside the brain). For HCP it is built from train subjects only. Built once
+  and **frozen**; runs added later reuse it. Only in-mask voxels are stored (235,026 voxels for HCP).
 - Per run: `T × V` float16 matrix + a per-run validity vector for voxels outside that run's
-  own mask. ≈ 0.56 GB per 1200-TR HCP run → ≈ 0.45 TB for the current 807 runs,
-  ≈ 2.5 TB for full HCP.
+  own mask. ≈ 0.56 GB per 1200-TR HCP run → ≈ 2.4 TB for full HCP (4,233 runs).
 
 Output layout:
 ```
@@ -82,8 +81,7 @@ so no resampling is needed; assert this.
 
 **B2. `parcellate(voxel_run, atlas)`** = mean of *valid* voxels per parcel (one sparse
 matmul), then z-score each parcel over time. Also returns per-parcel coverage.
-Usable offline (`parcellate.py --atlas <name>` → `atlas/<name>/…_timeseries.npy`) or on the
-fly in the dataset (`--input voxel | atlas:<name>`).
+Usable offline (CLI step `parcellate --name <name>` → `atlas/<name>/timeseries/`).
 
 ## Validation (before the full run)
 1. 2–3 HCP runs + 1 PTSD run: visual check of mask, filtering, atlas overlay; subcortex in mask.
@@ -93,14 +91,14 @@ fly in the dataset (`--input voxel | atlas:<name>`).
 
 ## Code layout
 Package with a per-dataset config (paths, filename pattern, confound names, TR source) so
-HCP / PTSD / UCLA share one code path: `inventory.py`, `denoise.py`, `voxel_store.py`
-(→ `preprocess.py`), `atlas.py` (prep + `parcellate()` + cache script), a dataset class
-(voxel or atlas input), and a resumable Slurm job-array launcher.
+HCP / PTSD / UCLA share one code path: `inventory.py`, `denoise.py`, `voxel_store.py`,
+`atlas.py`, `split.py`, and for HCP a manager + per-subject workers (`status.py`, `worker.py`,
+`scripts/preprocess_manager.sbatch`, `scripts/preprocess_subject.sbatch`).
 
 ## Steps
 1. Write the code.
 2. Test on 2–3 runs; review outputs together.
-3. Full run on Slurm into `rsfm_voxel/`; re-run as more fMRIPrep subjects finish.
+3. Manager on Slurm into `rsfm_voxel/`; it picks up subjects as fMRIPrep finishes them.
 
 ## Defaults for open decisions
 Low-pass 0.1 Hz (configurable; dropping it keeps HCP signal up to ~0.7 Hz) · no GSR ·
