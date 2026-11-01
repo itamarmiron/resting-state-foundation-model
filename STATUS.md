@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-29
+Last updated: 2026-11-01
 
 What exists in this repo and what is left to do. Update it at the end of every session that changes anything (see CLAUDE.md).
 
@@ -33,7 +33,7 @@ What exists in this repo and what is left to do. Update it at the end of every s
   - affinity and Procrustes match exactly;
   - the diffusion map matches at |corr| ≥ 0.9994 per component. Ours is the exact eigen-solution; BrainSpace runs a symmetric solver on a non-symmetric matrix.
   - `test_matches_brainspace` keeps this checked.
-- `tests/test_temporal_bit.py` (29 tests; 49 in total with preprocessing, the dataloader and the masks, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
+- `tests/test_temporal_bit.py` (29 tests; 64 in total across the repo, all passing) and `smoke_test_temporal_bit.py` (random input and a real window).
   - The tokenizer tests run for both voxel-embedding variants. One test checks that a full-rank table set to `codes @ W_up` gives exactly the low-rank output.
   - CPU only so far, B = 8 forward/backward: full rank 16.5 s, peak process memory 9.4 GiB; low rank (r = 64) 18 s, 8.9 GiB.
 
@@ -44,10 +44,20 @@ What exists in this repo and what is left to do. Update it at the end of every s
   - No normalization: the stored data is already z-scored per voxel.
   - Tested on synthetic runs (`tests/test_window_dataset.py`, 4 tests). On the real data root it finds sub-100206's 2 runs (120 windows); 4 workers read them in 1.2 s, and a batch runs through the model.
 - `roi_masks.py`: the Cross-ROI ("R") masks of slide 2 for one window. `ROIMaskSampler` returns disjoint, sorted `context (B, Kc)` and `target (B, Kt)` ROI indices; `ROIMaskCollator` is a `collate_fn` that adds them to a `WindowDataset` batch as `context_rois` / `target_rois`.
+  - These ratios and this sampling method are provisional (see Open decisions).
   - Ratios copied from Brain-JEPA (`MaskCollator_fmri` with `configs/ukb_vitb_ep300.yaml`): targets are 45–60 % of the ROIs (`pred_mask_R_scale`), the context keeps 84–100 % of the rest (`enc_mask_scale`), at least 4 context ROIs (`min_keep`). As in Brain-JEPA, ROIs are random (not contiguous), sizes are drawn once per batch and ROIs per sample. That gives about 170–250 context and 200–270 target ROIs out of 450.
   - One deviation: Brain-JEPA draws the context independently of the targets and truncates every sample to the batch's smallest context, which drops high-index ROIs first. Ours draws the context from the non-target ROIs at an exact size, so nothing is truncated (same expected size).
   - Brain-JEPA's time-axis masking (the beta/gamma blocks) has no counterpart, because the encoder pools time.
   - Tested (`tests/test_roi_masks.py`, 6 tests) and run on real data with the encoder.
+- `predictor.py`: `Predictor`, a small ViT after Brain-JEPA's `VisionTransformerPredictor`, with its config values (depth 6, width 384, 12 heads; 11 M parameters). `(B, Kc, D)` context features → `(B, Kt, D)` predictions.
+  - One query per target ROI: a shared mask token + the ROI's gradient position, always from the group gradients. Self-attention runs over context and queries together.
+  - This replaces slide 2's "narrow BIT cross-transformer". There is no minute offset (Δt) yet, because all targets are in the context's window.
+  - It takes any ROI index lists, so it does not depend on the masking choices. Tested in `tests/test_predictor.py` (7 tests).
+- `ema_target_encoder.py`: `EMATargetEncoder`, a frozen copy of the encoder, as in Brain-JEPA's `train.py`. It always encodes all ROIs, applies a parameter-free LayerNorm over D, then reads `target_rois`.
+  - `update(encoder, momentum)` averages the parameters; `ema_momentum(step, total_steps)` rises linearly from 0.996 to 1.0.
+  - One deviation: it is always in eval mode, so targets stay deterministic if dropout is enabled.
+  - Tested in `tests/test_ema_target_encoder.py` (8 tests).
+- The encoder, predictor and target encoder ran together for one step on real sub-100206 windows, with a throwaway MSE loss and SGD (full-size model, B = 4, 163 context and 265 target ROIs, CPU): finite outputs, 7.8 s, peak process memory 4.7 GiB. This is a wiring check, not the real loss or a training run.
 
 ## To do
 
@@ -65,7 +75,8 @@ What exists in this repo and what is left to do. Update it at the end of every s
 - [ ] Only if profiling shows the need: speed up the tokenizer by grouping ROIs by size.
 
 ### JEPA pretraining (slide 2)
-- [ ] A predictor (mask token + gradient positional embedding), an EMA target encoder (`roi_keep=None`), the loss and the training loop. Use the group gradients.
+- [ ] The loss and the training loop (optimizer, LR and weight-decay schedules, checkpoints).
+- [ ] Decide the masking ratios and sampling method (see Open decisions), then finalize `roi_masks.py`.
 - [ ] Optional: skip or down-weight high-motion windows using the stored per-TR FD (`qc/*_fd.npy`); the dataloader does not use it yet.
 - [ ] Later: cross-time targets from several windows of the same scan (the minute grid in slide 2): the "T" and "D" masks, in `roi_masks.py` next to the "R" masks.
 
@@ -74,6 +85,10 @@ What exists in this repo and what is left to do. Update it at the end of every s
 - The train/test split.
 - Gradients: UKB (Brain-JEPA) for now. Later, test HCP group gradients and per-subject gradients (and which leak option) against it.
 - When to move from T = 20 (14.4 s) to the slide-2 "minute" (≈ 83 TRs).
-- Context size: Brain-JEPA's (`context_scale=(0.84, 1.0)`, the default) or slide 2's, where every non-target ROI is visible (`context_scale=(1, 1)`).
+- **Future decision: masking ratios and sampling method.** `roi_masks.py` currently uses Brain-JEPA's values as placeholders. Still open:
+  - the target fraction (now 45–60 %);
+  - the context size: Brain-JEPA's (`context_scale=(0.84, 1.0)`, the default) or slide 2's, where every non-target ROI is visible (`context_scale=(1, 1)`);
+  - how ROIs are sampled (now uniformly random, not contiguous or network-based).
+- Loss: Brain-JEPA's smooth L1 or slide 2's L2.
 - Voxel embeddings: full rank (default, as in Brain-IT) or low rank (`voxel_rank`). Decide after comparing them in pretraining.
 - Adding the cerebellum later: this changes N, the voxel embeddings and the gradients.
